@@ -24,7 +24,7 @@ on:
         required: true
         default: 'device/realme/macedonia'
       DEVICE_NAME:
-        description: 'Specify your Device Codename' # As is, just like your PRODUCT_DEVICE in your device tree.
+        description: 'Build makefile/device name hint (used to find twrp_<name>.mk or omni_<name>.mk)'
         required: true
         default: 'macedonia'
       BUILD_TARGET:
@@ -49,7 +49,7 @@ jobs:
     steps:
     - name: Check Out
       uses: actions/checkout@v4
-      
+
     - name: Display Inputs
       run: |
         echo "Displaying variables/inputs."
@@ -57,17 +57,16 @@ jobs:
         echo "Device Tree: ${{ inputs.DEVICE_TREE }}"
         echo "Device Branch: ${{ inputs.DEVICE_TREE_BRANCH }}"
         echo "Device Path: ${{ inputs.DEVICE_PATH }}"
-        echo "Device Name: ${{ inputs.DEVICE_NAME }}"
+        echo "Device Name Hint: ${{ inputs.DEVICE_NAME }}"
         echo "Build Target: ${{ inputs.BUILD_TARGET }}image"
 
     - name: Cleanup
       uses: rokibhasansagar/slimhub_actions@main
-      
+
     - name: Set Swap Space
       uses: pierotofy/set-swap-space@master
       with:
         swap-size-gb: 24
-        
 
     - name: Prepare the environment
       run: |
@@ -108,12 +107,12 @@ jobs:
         git config --global user.name "${{ github.actor }}"
         git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
         repo init --depth=1 -u ${{ steps.manifest.outputs.value }} -b ${{ inputs.MANIFEST_BRANCH }}
-        
+
     - name: Repo Sync
       run: |
         cd android-recovery
         repo sync -j$(nproc --all) --force-sync
-      
+
     - name: Clone Device Tree
       run: |
         cd android-recovery
@@ -124,24 +123,44 @@ jobs:
     - name: Check Build Makefile
       run: |
         cd android-recovery
-        if [ -f ${{ inputs.DEVICE_PATH }}/twrp_${{ inputs.DEVICE_NAME}}.mk ]; then
+        if [ -f ${{ inputs.DEVICE_PATH }}/twrp_${{ inputs.DEVICE_NAME }}.mk ]; then
             echo "DEVICE_MAKEFILE=twrp_${{ inputs.DEVICE_NAME }}" >> $GITHUB_ENV
-        elif [ -f ${{ inputs.DEVICE_PATH }}/omni_${{ inputs.DEVICE_NAME}}.mk ]; then
+        elif [ -f ${{ inputs.DEVICE_PATH }}/omni_${{ inputs.DEVICE_NAME }}.mk ]; then
             echo "DEVICE_MAKEFILE=omni_${{ inputs.DEVICE_NAME }}" >> $GITHUB_ENV
         else
             echo "No recovery makefile file found!"
+            exit 1
         fi
-      continue-on-error: true
 
-    - name: Building Image 
+    - name: Building Image
       run: |
         cd android-recovery
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
-        lunch ${{ env.DEVICE_MAKEFILE }}-eng && make clean && make ${{ inputs.BUILD_TARGET }}image -j$(nproc --all)
+
+        lunch "${{ env.DEVICE_MAKEFILE }}-eng"
+
+        # Do not assume the user-supplied DEVICE_NAME is identical to
+        # TARGET_DEVICE or the output-directory name. Ask the Android build
+        # system for the resolved values after lunch.
+        TARGET_DEVICE_REAL="$(get_build_var TARGET_DEVICE)"
+        PRODUCT_OUT_REAL="$(get_build_var PRODUCT_OUT)"
+        if [[ "$PRODUCT_OUT_REAL" = /* ]]; then
+            PRODUCT_OUT_ABS="$PRODUCT_OUT_REAL"
+        else
+            PRODUCT_OUT_ABS="$PWD/$PRODUCT_OUT_REAL"
+        fi
+
+        echo "Resolved TARGET_DEVICE: $TARGET_DEVICE_REAL"
+        echo "Resolved PRODUCT_OUT: $PRODUCT_OUT_ABS"
+        echo "TARGET_DEVICE_REAL=$TARGET_DEVICE_REAL" >> $GITHUB_ENV
+        echo "PRODUCT_OUT_ABS=$PRODUCT_OUT_ABS" >> $GITHUB_ENV
+
+        make clean
+        make ${{ inputs.BUILD_TARGET }}image -j$(nproc --all)
         echo "Done building your ${{ inputs.BUILD_TARGET }}.img"
-      
-    - name: Set Other Build Properties # Output will be use in Release
+
+    - name: Set Other Build Properties
       run: |
         echo "BUILD_DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
         echo "VENDOR=$(echo "${{ inputs.DEVICE_PATH }}" | cut -d'/' -f2)" >> $GITHUB_ENV
@@ -149,7 +168,7 @@ jobs:
     - name: Compressing TWRP Build (if Samsung)...
       if: env.VENDOR == 'samsung'
       run: |
-        cd android-recovery/out/target/product/${{ inputs.DEVICE_NAME }}
+        cd "$PRODUCT_OUT_ABS"
         if [ "${{ inputs.BUILD_TARGET }}" = "boot" ] || [ "${{ inputs.BUILD_TARGET }}" = "recovery" ]; then
           echo "Compressing ${{ inputs.BUILD_TARGET }}.img"
           tar -cvf ${{ inputs.BUILD_TARGET }}.tar ${{ inputs.BUILD_TARGET }}.img
@@ -159,39 +178,130 @@ jobs:
         else
           echo "Unknown build target. Skipping tar..."
         fi
-      
-    - name: Upload to Release (boot and becovery)
+
+    - name: Stage Build Artifacts
+      run: |
+        mkdir -p release-artifacts
+        shopt -s nullglob
+
+        if [ "${{ inputs.BUILD_TARGET }}" = "vendorboot" ]; then
+            artifacts=("$PRODUCT_OUT_ABS"/vendor_boot.*)
+        else
+            artifacts=("$PRODUCT_OUT_ABS"/${{ inputs.BUILD_TARGET }}.*)
+        fi
+
+        if [ ${#artifacts[@]} -eq 0 ]; then
+            echo "No build artifacts found in resolved PRODUCT_OUT: $PRODUCT_OUT_ABS"
+            exit 1
+        fi
+
+        cp -v "${artifacts[@]}" release-artifacts/
+        echo "Staged artifacts:"
+        ls -lh release-artifacts/
+
+    - name: Upload to Release (boot and recovery)
       if: inputs.BUILD_TARGET == 'boot' || inputs.BUILD_TARGET == 'recovery'
       uses: softprops/action-gh-release@v2
       with:
-        files: |
-          android-recovery/out/target/product/${{ inputs.DEVICE_NAME }}/${{ inputs.BUILD_TARGET }}.*
-        name: Unofficial TWRP for ${{ inputs.DEVICE_NAME }} // ${{ env.BUILD_DATE }}
+        files: release-artifacts/*
+        name: Unofficial TWRP for ${{ env.TARGET_DEVICE_REAL }} // ${{ env.BUILD_DATE }}
         tag_name: ${{ github.run_id }}
         body: |
           Build: ${{ inputs.MANIFEST_BRANCH }}
           Device: [Device Tree/Branch](${{ inputs.DEVICE_TREE }}/tree/${{ inputs.DEVICE_TREE_BRANCH }})
+          Resolved TARGET_DEVICE: ${{ env.TARGET_DEVICE_REAL }}
           Commit: Most recent [commit](${{ inputs.DEVICE_TREE }}/commit/${{ env.COMMIT_ID }}) during building.
 
     - name: Upload to Release (if vendor_boot)
       if: inputs.BUILD_TARGET == 'vendorboot'
       uses: softprops/action-gh-release@v2
       with:
-        files: |
-          android-recovery/out/target/product/${{ inputs.DEVICE_NAME }}/vendor_boot.*
-        name: Unofficial TWRP for ${{ inputs.DEVICE_NAME }} // ${{ env.BUILD_DATE }}
+        files: release-artifacts/*
+        name: Unofficial TWRP for ${{ env.TARGET_DEVICE_REAL }} // ${{ env.BUILD_DATE }}
         tag_name: ${{ github.run_id }}
         body: |
           Build: ${{ inputs.MANIFEST_BRANCH }}
           Device: [Device Tree/Branch](${{ inputs.DEVICE_TREE }}/tree/${{ inputs.DEVICE_TREE_BRANCH }})
+          Resolved TARGET_DEVICE: ${{ env.TARGET_DEVICE_REAL }}
           Commit: Most recent [commit](${{ inputs.DEVICE_TREE }}/commit/${{ env.COMMIT_ID }}) during building.
 
     - name: Run LDCheck
       run: |
-        cd tools
-        mv -n libneeds ${GITHUB_WORKSPACE}/android-recovery/out/target/product/${{ inputs.DEVICE_NAME }}/recovery/root/
-        mv -n ldcheck ${GITHUB_WORKSPACE}/android-recovery/out/target/product/${{ inputs.DEVICE_NAME }}/recovery/root/
-        cd ../android-recovery/out/target/product/${{ inputs.DEVICE_NAME }}/recovery/root
-        python3 ldcheck/ldcheck -p $OUT/recovery/root/system/lib64:$OUT/recovery/root/system/lib64/hw:$OUT/recovery/root/vendor/lib64:$OUT/recovery/root/vendor/lib64/hw -d $OUT/recovery/root/vendor/bin/*; python3 ldcheck/ldcheck -p $OUT/recovery/root/system/lib64:$OUT/recovery/root/system/lib64/hw:$OUT/recovery/root/vendor/lib64:$OUT/recovery/root/vendor/lib64/hw -d $OUT/recovery/root/vendor/bin/hw/*; python3 ldcheck/ldcheck -p $OUT/recovery/root/system/lib64:$OUT/recovery/root/system/lib64/hw:$OUT/recovery/root/vendor/lib64:$OUT/recovery/root/vendor/lib64/hw -d $OUT/recovery/root/vendor/lib64/*; python3 ldcheck/ldcheck -p $OUT/recovery/root/system/lib64:$OUT/recovery/root/system/lib64/hw:$OUT/recovery/root/vendor/lib64:$OUT/recovery/root/vendor/lib64/hw -d $OUT/recovery/root/system//bin/*
-        echo "Done checking missing dependencies. Review, and reconfigure your tree."
+        ROOT="$PRODUCT_OUT_ABS/recovery/root"
+
+        # LDCheck only makes sense when a recovery ramdisk tree exists.
+        if [ ! -d "$ROOT" ]; then
+            echo "No recovery/root directory at $ROOT; skipping LDCheck."
+            exit 0
+        fi
+
+        cp -n tools/libneeds "$ROOT/" || true
+        cp -n tools/ldcheck "$ROOT/" || true
+
+        checked=0
+        failed=0
+
+        build_search_path() {
+            local elf_class="$1"
+            local libdir
+            local paths=()
+
+            if [ "$elf_class" = "ELF64" ]; then
+                libdir="lib64"
+            else
+                libdir="lib"
+            fi
+
+            for partition in system vendor product system_ext odm; do
+                for d in \
+                    "$ROOT/$partition/$libdir" \
+                    "$ROOT/$partition/$libdir/hw"; do
+                    [ -d "$d" ] && paths+=("$d")
+                done
+            done
+
+            local joined=""
+            local p
+            for p in "${paths[@]}"; do
+                if [ -z "$joined" ]; then
+                    joined="$p"
+                else
+                    joined="$joined:$p"
+                fi
+            done
+            printf '%s' "$joined"
+        }
+
+        while IFS= read -r -d '' f; do
+            # Skip non-ELF files instead of assuming every file in bin/lib is ELF.
+            if ! readelf -h "$f" >/dev/null 2>&1; then
+                continue
+            fi
+
+            elf_class="$(readelf -h "$f" 2>/dev/null | awk '/Class:/ {print $2; exit}')"
+            search_path="$(build_search_path "$elf_class")"
+
+            if [ -z "$search_path" ]; then
+                echo "No matching library search path for $elf_class file: $f"
+                continue
+            fi
+
+            echo "LDCheck [$elf_class]: $f"
+            if ! python3 "$ROOT/ldcheck" -p "$search_path" -d "$f"; then
+                failed=$((failed + 1))
+            fi
+            checked=$((checked + 1))
+        done < <(
+            find \
+                "$ROOT/system/bin" \
+                "$ROOT/vendor/bin" \
+                "$ROOT/system/lib" \
+                "$ROOT/system/lib64" \
+                "$ROOT/vendor/lib" \
+                "$ROOT/vendor/lib64" \
+                -maxdepth 2 -type f -print0 2>/dev/null
+        )
+
+        echo "LDCheck examined $checked ELF files; checker process failures: $failed"
+        echo "Done checking missing dependencies. Review unresolved-symbol output above."
       continue-on-error: true
